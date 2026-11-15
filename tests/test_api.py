@@ -84,6 +84,17 @@ def test_transfer_errors(client: TestClient, conn: Conn) -> None:
     assert transfer(client, alpha_auth, {**ok, "amount": 4}, "reused") == 409
 
 
+def test_longest_allowed_key_fits_in_the_database(client: TestClient, conn: Conn) -> None:
+    # the API adds "account-<id>:" in front, so it must stay under the
+    # 200 character limit on operations.idempotency_key
+    alpha, alpha_auth = player(conn, "player_alpha", 100)
+    bravo, _ = player(conn, "player_bravo")
+    body = {"from_account_id": alpha, "to_account_id": bravo, "amount": 1}
+
+    assert transfer(client, alpha_auth, body, "k" * 150) == 201
+    assert transfer(client, alpha_auth, body, "k" * 151) == 422
+
+
 def test_idempotency_keys_are_per_caller(client: TestClient, conn: Conn) -> None:
     alpha, alpha_auth = player(conn, "player_alpha", 100)
     bravo, bravo_auth = player(conn, "player_bravo", 100)

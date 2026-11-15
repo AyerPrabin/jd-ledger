@@ -135,7 +135,7 @@ def create_app(url: str | None = None, admin_token: str | None = None) -> FastAP
         response: Response,
         conn: Db,
         caller: Caller,
-        idempotency_key: Annotated[str, Header(min_length=1, max_length=200)],
+        idempotency_key: Annotated[str, Header(min_length=1, max_length=150)],
     ) -> OperationOut:
         if body.from_account_id != caller:
             raise HTTPException(403, "you can only send from your own account")
