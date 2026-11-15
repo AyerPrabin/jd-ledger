@@ -1,0 +1,25 @@
+[project]
+name = "jd-ledger"
+version = "0.1.0"
+description = "A small points-wallet ledger on PostgreSQL"
+requires-python = ">=3.12"
+license = "MIT"
+authors = [{ name = "Prabin Ayer" }]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["jd_ledger"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = [
+    "ignore:Using `httpx` with `starlette.testclient`",
+]
