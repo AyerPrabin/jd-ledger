@@ -1,7 +1,7 @@
 import pytest
 from psycopg import errors
 
-from jd_ledger import ledger
+from jd_ledger import auth, ledger
 from jd_ledger.ledger import Conn
 from tests.conftest import key, make_player, total_points
 
@@ -262,3 +262,40 @@ def test_list_entries_pages_newest_first(conn: Conn) -> None:
 def test_list_entries_for_unknown_account(conn: Conn) -> None:
     with pytest.raises(ledger.AccountNotFound):
         ledger.list_entries(conn, 9999)
+
+
+# --- system accounts and tokens -------------------------------------------
+
+
+def test_transfers_cannot_touch_the_issuance_account(conn: Conn) -> None:
+    alpha = make_player(conn, "player_alpha", 100)
+    issuance = 1
+
+    with pytest.raises(ledger.SystemAccount):
+        ledger.transfer(conn, issuance, alpha, 1_000_000, idempotency_key=key())
+    with pytest.raises(ledger.SystemAccount):
+        ledger.transfer(conn, alpha, issuance, 10, idempotency_key=key())
+
+    assert balance(conn, alpha) == 100
+    assert total_points(conn) == 0
+
+
+def test_tokens_are_stored_hashed(conn: Conn) -> None:
+    alpha = make_player(conn, "player_alpha")
+    token = auth.issue_token(conn, alpha)
+    secret = token.split(".", 1)[1]
+
+    row = conn.execute("SELECT api_token_hash FROM accounts WHERE id = %s", (alpha,)).fetchone()
+    assert row is not None
+    assert secret not in row[0]
+    assert auth.account_for_token(conn, token) == alpha
+    assert auth.account_for_token(conn, token + "x") is None
+    # a full-width "2" passes str.isdigit() but is not a valid id
+    assert auth.account_for_token(conn, "２." + token.split(".", 1)[1]) is None
+
+
+def test_system_accounts_cannot_get_a_token(conn: Conn) -> None:
+    with pytest.raises(ledger.SystemAccount):
+        auth.issue_token(conn, 1)
+    with pytest.raises(errors.CheckViolation):
+        conn.execute("UPDATE accounts SET api_token_hash = 'x' WHERE id = 1")

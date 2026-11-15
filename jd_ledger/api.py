@@ -1,8 +1,14 @@
 """A thin HTTP layer over jd_ledger.ledger.
 
+Every request except /health needs "Authorization: Bearer <token>".
+Player tokens come from python -m jd_ledger.auth and only give access to
+that player's own account. /reconcile needs the ADMIN_TOKEN from the
+environment and is switched off when it is not set.
+
 Run with: uvicorn jd_ledger.api:app
 """
 
+import os
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from typing import Annotated
@@ -11,7 +17,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Res
 from psycopg_pool import ConnectionPool
 from pydantic import BaseModel, Field
 
-from jd_ledger import ledger
+from jd_ledger import auth, ledger
 from jd_ledger.db import database_url
 from jd_ledger.ledger import Conn
 
@@ -66,20 +72,27 @@ ERRORS: dict[type[ledger.LedgerError], tuple[int, str]] = {
     ledger.InvalidAmount: (400, "amount must be a positive whole number"),
     ledger.InsufficientFunds: (422, "insufficient funds"),
     ledger.IdempotencyConflict: (409, "idempotency key was already used for a different request"),
+    ledger.SystemAccount: (403, "system accounts cannot be used here"),
 }
 
 
-def create_app(url: str | None = None) -> FastAPI:
+def _bearer(authorization: str | None) -> str:
+    scheme, _, token = (authorization or "").partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        raise HTTPException(401, "missing bearer token", {"WWW-Authenticate": "Bearer"})
+    return token.strip()
+
+
+def create_app(url: str | None = None, admin_token: str | None = None) -> FastAPI:
+    admin_token = admin_token or os.environ.get("ADMIN_TOKEN") or None
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        pool = ConnectionPool(
+        with ConnectionPool(
             url or database_url(), min_size=1, max_size=10, kwargs={"autocommit": True}
-        )
-        app.state.pool = pool
-        try:
+        ) as pool:
+            app.state.pool = pool
             yield
-        finally:
-            pool.close()
 
     app = FastAPI(title="jd-ledger", lifespan=lifespan)
 
@@ -89,6 +102,27 @@ def create_app(url: str | None = None) -> FastAPI:
             yield conn
 
     Db = Annotated[Conn, Depends(get_conn)]
+    AuthHeader = Annotated[str | None, Header()]
+
+    def current_account(conn: Db, authorization: AuthHeader = None) -> int:
+        account_id = auth.account_for_token(conn, _bearer(authorization))
+        if account_id is None:
+            raise HTTPException(401, "invalid token", {"WWW-Authenticate": "Bearer"})
+        return account_id
+
+    def require_admin(authorization: AuthHeader = None) -> None:
+        if not auth.is_admin(_bearer(authorization), admin_token):
+            raise HTTPException(401, "admin token required", {"WWW-Authenticate": "Bearer"})
+
+    Caller = Annotated[int, Depends(current_account)]
+
+    def own_account(account_id: int, caller: Caller) -> int:
+        # 403 for any account that is not yours, whether it exists or not
+        if account_id != caller:
+            raise HTTPException(403, "you can only see your own account")
+        return account_id
+
+    OwnAccount = Annotated[int, Depends(own_account)]
 
     @app.get("/health")
     def health(conn: Db) -> dict[str, str]:
@@ -100,15 +134,20 @@ def create_app(url: str | None = None) -> FastAPI:
         body: TransferIn,
         response: Response,
         conn: Db,
+        caller: Caller,
         idempotency_key: Annotated[str, Header(min_length=1, max_length=200)],
     ) -> OperationOut:
+        if body.from_account_id != caller:
+            raise HTTPException(403, "you can only send from your own account")
         try:
             op = ledger.transfer(
                 conn,
                 body.from_account_id,
                 body.to_account_id,
                 body.amount,
-                idempotency_key=idempotency_key,
+                # keys are per caller, so one player cannot collide with
+                # (or probe for) another player's keys
+                idempotency_key=f"account-{caller}:{idempotency_key}",
             )
         except ledger.LedgerError as exc:
             status, message = ERRORS.get(type(exc), (400, "request failed"))
@@ -123,30 +162,24 @@ def create_app(url: str | None = None) -> FastAPI:
         )
 
     @app.get("/accounts/{account_id}")
-    def get_account(account_id: int, conn: Db) -> AccountOut:
-        try:
-            account = ledger.get_account(conn, account_id)
-        except ledger.AccountNotFound as exc:
-            raise HTTPException(404, "account not found") from exc
+    def get_account(account_id: OwnAccount, conn: Db) -> AccountOut:
+        account = ledger.get_account(conn, account_id)
         return AccountOut(id=account.id, name=account.name, balance=account.balance)
 
     @app.get("/accounts/{account_id}/entries")
     def get_entries(
-        account_id: int,
+        account_id: OwnAccount,
         conn: Db,
         limit: Annotated[int, Query(ge=1, le=200)] = 50,
         before_id: Annotated[int | None, Query(ge=1)] = None,
     ) -> EntriesPage:
-        try:
-            entries = ledger.list_entries(conn, account_id, limit=limit, before_id=before_id)
-        except ledger.AccountNotFound as exc:
-            raise HTTPException(404, "account not found") from exc
+        entries = ledger.list_entries(conn, account_id, limit=limit, before_id=before_id)
         return EntriesPage(
             entries=[EntryOut(**vars(e)) for e in entries],
             next_before_id=entries[-1].id if len(entries) == limit else None,
         )
 
-    @app.get("/reconcile")
+    @app.get("/reconcile", dependencies=[Depends(require_admin)])
     def get_reconcile(conn: Db) -> ReconcileOut:
         mismatches = ledger.reconcile(conn)
         return ReconcileOut(

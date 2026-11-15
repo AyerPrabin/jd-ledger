@@ -60,6 +60,10 @@ class AlreadyRefunded(LedgerError):
     pass
 
 
+class SystemAccount(LedgerError):
+    """Transfers may not touch the issuance account; only credit/debit can."""
+
+
 @dataclass(frozen=True)
 class Entry:
     id: int
@@ -243,6 +247,10 @@ def _apply(
         missing = [a for a in account_ids if a not in balances]
         if missing:
             raise AccountNotFound(missing[0])
+        # Without this, a transfer out of the issuance account would mint
+        # points from nothing.
+        if kind == "transfer" and any(allow_negative.values()):
+            raise SystemAccount("transfers cannot use a system account")
 
         entries: list[Entry] = []
         for account_id, amount in legs:
