@@ -10,9 +10,7 @@ It is a rebuild of the wallet core of JD Esports Arena, the Free Fire tournament
 
 ## Why I built it
 
-On my platform I run a check that every wallet balance equals its ledger total. That check has always passed, but the wallet code grew bit by bit and I had never tested the awkward cases on purpose: a phone that retries a payment because the network dropped, two requests hitting the same wallet at the same moment, or a refund being clicked twice.
-
-So I rebuilt just the core, on its own, and wrote tests for exactly those cases. The tests run against a real PostgreSQL database in CI, not a mock, because most of the rules live in the database.
+On my platform I check that every wallet balance equals its ledger total. I wanted to rebuild that core properly, on its own, and test the hard parts: a phone that retries a payment because the network dropped, two requests hitting the same wallet at the same moment, and a refund being clicked twice. The tests run against a real PostgreSQL database in CI, not a mock, because most of the rules live in the database.
 
 ## How it fits together
 
@@ -153,7 +151,7 @@ The API docs are at http://localhost:8000/docs.
 
 | Method | Path | Notes |
 | --- | --- | --- |
-| POST | `/transfers` | needs `Idempotency-Key`. `201` new, `200` replay, `403` not your account or a system account, `409` key reused with a different body, `422` insufficient funds |
+| POST | `/transfers` | needs `Idempotency-Key` (up to 150 characters). `201` new, `200` replay, `403` not your account or a system account, `409` key reused with a different body, `422` insufficient funds |
 | GET | `/accounts/{id}` | your own account only |
 | GET | `/accounts/{id}/entries` | newest first, `limit` (max 200) and `before_id` for the next page |
 | GET | `/reconcile` | admin token only. `{"ok": true, "mismatches": []}` when everything adds up |
@@ -183,7 +181,7 @@ mypy
 
 Without `TEST_DATABASE_URL` the database tests are skipped on your machine. In CI a missing database is an error rather than a skip, so a green CI run means the tests really ran.
 
-There are 60 tests:
+There are 61 test cases (some are parametrised):
 
 - `test_ledger.py`: each operation, the error cases, and the database rules above (append-only trigger, check constraint, unbalanced operation rejected at commit, reconcile finding a tampered balance)
 - `test_idempotency.py`: retries, key reuse with a different body, failed requests not using up a key, ten parallel copies of one request
@@ -207,6 +205,7 @@ GitHub Actions runs ruff, `mypy --strict` and pytest against a `postgres:16` ser
 - Credits and debits always go against the single `issuance` account. A real system would have separate accounts for top-ups, fees and prizes.
 - Points are whole numbers (`BIGINT`). There are no currencies, decimals or exchange rates.
 - Old idempotency keys are kept forever. A real service would expire them after a while.
+- The append-only trigger stops `UPDATE` and `DELETE`, but not `TRUNCATE` or a superuser who disables triggers. The tests rely on `TRUNCATE` to reset the database. In a real deployment the app's database user would not own the tables.
 - Everything runs in one PostgreSQL database, so there are no distributed transactions to worry about.
 
 ## Licence
