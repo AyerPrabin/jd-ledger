@@ -39,3 +39,27 @@ jobs:
       - name: Tests
         run: pytest -v
 
+  compose:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start api and postgres
+        run: docker compose up -d --build --wait
+      - name: Load demo accounts
+        run: docker compose exec -T api python -m jd_ledger.demo
+      - name: Try the API
+        run: |
+          set -e
+          curl -fsS http://localhost:8000/accounts/2
+          echo
+          curl -fsS -X POST http://localhost:8000/transfers \
+            -H "Content-Type: application/json" -H "Idempotency-Key: ci-check-1" \
+            -d '{"from_account_id": 2, "to_account_id": 3, "amount": 25}'
+          echo
+          curl -fsS http://localhost:8000/accounts/2/entries?limit=5
+          echo
+          curl -fsS http://localhost:8000/reconcile | grep '"ok":true'
+      - name: Logs
+        if: failure()
+        run: docker compose logs
