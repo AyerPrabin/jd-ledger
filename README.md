@@ -20,6 +20,7 @@ jd_ledger/ledger.py credit, debit, transfer, refund, reconcile
 jd_ledger/auth.py   API tokens
 jd_ledger/api.py    small FastAPI layer on top
 tests/              pytest + Hypothesis, against PostgreSQL
+load/               k6 load test, seed script and database check
 ```
 
 Three tables:
@@ -191,13 +192,74 @@ There are 61 test cases (some are parametrised):
 
 GitHub Actions runs ruff, `mypy --strict` and pytest against a `postgres:16` service container on every push. A second job builds the image, starts the stack with `docker compose up --wait`, loads the demo accounts and calls the endpoints with curl.
 
+## Load test: 21,781 transfers from 200 concurrent users
+
+The tests above use threads inside one Python process. I also wanted to see the whole stack under load over HTTP, so there is a [k6](https://k6.io) load test in `load/` and a separate [Load test workflow](.github/workflows/load.yml). It runs on demand and whenever `load/` changes.
+
+What one run does:
+
+1. `load/seed.py` creates 50 accounts, each with an API token. The 4 "hot" accounts get 1,000,000 points each and the other 46 get 100,000 each. The API has no endpoint for creating accounts or loading points, so this goes through the ledger code.
+2. uvicorn serves the API as it ships: one worker, a connection pool of 10.
+3. `load/transfers.js` ramps k6 up to 200 virtual users over 10 seconds and holds them for 45 seconds. They send transfers as fast as the answers come back, with no pause between requests.
+   - About 70% of transfers go between the 4 hot accounts, in a random direction. A to B and B to A run at the same moment and queue on the same row locks, which is the case the lock ordering is there for.
+   - About 10% of iterations send 3 identical copies of one transfer at the same moment, with the same token and the same `Idempotency-Key`. k6 checks that exactly one copy gets `201`, that the others get `200` with `Idempotent-Replayed: true`, and that all copies return the same operation id.
+4. `load/verify.py` then checks the database and compares it with k6's counts.
+
+### Results
+
+From [run 44011591187](https://github.com/AyerPrabin/jd-ledger/actions/runs/44011591187) (commit `cbe2b09`, 17 Nov 2026). The full k6 summary is attached to the run as an artifact.
+
+| | |
+| --- | --- |
+| Peak virtual users | 200 |
+| HTTP requests | 26,043 in 60 s |
+| Requests per second | 434 |
+| Latency p50 / p95 / p99 | 543 / 578 / 591 ms |
+| Latency max | 683 ms |
+| Failed requests | 0.00% (0 errors, 0 timeouts) |
+| New transfers (`201`) | 21,781 |
+| Idempotent replays (`200`) | 4,262 |
+| Duplicate groups sent / applied exactly once | 2,131 / 2,131 |
+| PostgreSQL deadlocks | 0 |
+| Retries | none. The API does not retry, and it did not need to |
+| k6 checks passed | 28,174 of 28,174 |
+
+Latency is mostly time spent queueing. 200 users always waiting on one Python worker means each request waits about 200 / 434 = 0.46 s, which is close to the median. The p99 is only 48 ms above the median, so no request got stuck behind a lock for long.
+
+Every database check passed after the run:
+
+- every operation's entries sum to zero, and every operation has exactly 2 entries
+- no player balance is below zero
+- `reconcile_mismatches` is empty, so every balance equals its ledger sum
+- on every account, `balance_after` is a correct running total in entry order. A lost update would break this.
+- the sum of all balances is 0, and the players still hold exactly the 8,600,000 points they were seeded with
+- the only credits are the 50 seed credits, so no points were created
+- no idempotency key appears twice
+- the database holds exactly 21,781 transfers, the same as the number of `201` responses k6 received
+- the duplicate keys produced exactly 2,131 operations, one for each group
+
+### What the first run found
+
+The first run ([44011129018](https://github.com/AyerPrabin/jd-ledger/actions/runs/44011129018)) failed, on the same runner type and with the same script. It managed only 14 requests a second. 80 requests returned `500` with `PoolTimeout`, 76 got no answer within k6's 60 s timeout, and p95 latency was 60 s. Even so, every database check passed: 0 deadlocks and no money lost. 4 transfers committed after the client had already given up waiting (709 rows against 705 `201` responses). That is exactly the case where a client retries with the same `Idempotency-Key` and gets the stored result back.
+
+The cause was in the API layer, not the locks. `get_conn` was a plain `def` dependency, so FastAPI ran it on its pool of about 40 worker threads, and each request waited for a database connection inside `pool.getconn()` on one of those threads. With 200 users, all 40 threads were soon waiting there. The 10 requests that did hold connections then had no thread left to finish on, so nothing moved until the 30 s pool timeout fired. Now requests wait for a pool slot on an `asyncio.Semaphore`, on the event loop, and only take a worker thread once a connection is free (commit `cbe2b09`). The pool size and everything else stayed the same. The second run above is after the fix.
+
+### Limits of this test
+
+- It is a single run on one GitHub-hosted `ubuntu-latest` runner. The job printed 4 vCPU, 15 GB RAM, Intel Xeon 6975P-C. Shared runners vary, so treat the numbers as a rough guide, not a benchmark.
+- k6, the API and PostgreSQL all run on that one machine and compete for the same CPUs. There is no network latency between them.
+- One uvicorn worker and a pool of 10 connections, as shipped. More workers would very likely raise throughput, but I have not measured that.
+- The database is fresh and small, with 50 accounts and about 22,000 operations. It does not show how things behave with millions of rows or a cold cache.
+- Only `POST /transfers` is tested. The hot accounts hold so much that the insufficient-funds path (`422`) never triggered.
+- Auth is part of every request (a token lookup and a sha256), so the numbers include it.
+
 ## What I'd add next
 
 - An `entry_fee` / `prize` operation for whole events, so paying out 50/30/20 to three teams is one transaction
 - Token expiry and a proper login, or reuse the platform's existing auth
 - Rate limiting on `POST /transfers`
 - A scheduled job that runs reconcile and alerts if it is ever not empty
-- A load test to see where the row locks start to hurt, for example a single event pool account receiving hundreds of entry fees at once
+- A load test against a single event pool account receiving hundreds of entry fees at once, and with more uvicorn workers, to see where the row locks start to hurt
 
 ## Limitations
 
