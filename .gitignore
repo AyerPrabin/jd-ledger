@@ -6,3 +6,4 @@ __pycache__/
 .mypy_cache/
 .hypothesis/
 .env
+load/out/

@@ -1,0 +1,82 @@
+name: Load test
+
+on:
+  workflow_dispatch:
+    inputs:
+      peak_vus:
+        description: Peak number of k6 virtual users
+        default: "200"
+  push:
+    paths:
+      - "load/**"
+      - ".github/workflows/load.yml"
+
+jobs:
+  load:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: jd_ledger_load
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/jd_ledger_load
+      PEAK_VUS: ${{ inputs.peak_vus || '200' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - uses: grafana/setup-k6-action@v1
+      - name: Runner
+        run: |
+          {
+            echo "Runner: $(nproc) vCPU, $(free -g | awk '/Mem:/ {print $2}') GB RAM, $(lscpu | sed -n 's/^Model name: *//p')"
+            echo "$(k6 version | head -1), PostgreSQL 16 service container, one uvicorn worker, pool max_size 10"
+            echo
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Seed accounts
+        run: python -m load.seed
+      - name: Start the API
+        run: |
+          nohup uvicorn jd_ledger.api:app --host 127.0.0.1 --port 8000 \
+            --no-access-log --log-level warning > load/out/uvicorn.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8000/health && exit 0
+            sleep 1
+          done
+          cat load/out/uvicorn.log
+          exit 1
+      - name: Run k6
+        run: k6 run load/transfers.js
+      - name: Verify the database
+        if: always()
+        run: python -m load.verify
+      - name: Server errors
+        if: always()
+        run: |
+          echo "uvicorn log lines: $(wc -l < load/out/uvicorn.log)"
+          for p in Traceback DeadlockDetected PoolTimeout SerializationFailure; do
+            echo "- $p: $(grep -c "$p" load/out/uvicorn.log || true)"
+          done | tee -a "$GITHUB_STEP_SUMMARY"
+          tail -n 40 load/out/uvicorn.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: k6-summary
+          path: |
+            load/out/summary.json
+            load/out/uvicorn.log
+          if-no-files-found: warn
