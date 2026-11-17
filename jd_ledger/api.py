@@ -8,14 +8,16 @@ environment and is switched off when it is not set.
 Run with: uvicorn jd_ledger.api:app
 """
 
+import asyncio
 import os
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from psycopg_pool import ConnectionPool
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 from jd_ledger import auth, ledger
 from jd_ledger.db import database_url
@@ -65,6 +67,9 @@ class ReconcileOut(BaseModel):
     mismatches: list[MismatchOut]
 
 
+POOL_SIZE = 10
+
+
 # status code and message for each error a transfer can raise
 ERRORS: dict[type[ledger.LedgerError], tuple[int, str]] = {
     ledger.AccountNotFound: (404, "account not found"),
@@ -89,17 +94,27 @@ def create_app(url: str | None = None, admin_token: str | None = None) -> FastAP
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         with ConnectionPool(
-            url or database_url(), min_size=1, max_size=10, kwargs={"autocommit": True}
+            url or database_url(), min_size=1, max_size=POOL_SIZE, kwargs={"autocommit": True}
         ) as pool:
             app.state.pool = pool
+            app.state.pool_slots = asyncio.Semaphore(POOL_SIZE)
             yield
 
     app = FastAPI(title="jd-ledger", lifespan=lifespan)
 
-    def get_conn(request: Request) -> Iterator[Conn]:
+    async def get_conn(request: Request) -> AsyncIterator[Conn]:
+        # Requests wait for a free connection here, on the event loop, and
+        # only then take a worker thread to fetch it. If they waited inside
+        # pool.getconn() instead, every worker thread could end up waiting
+        # while the requests that hold the connections have no thread left
+        # to finish on (the load test found this, see the README).
         pool: ConnectionPool[Conn] = request.app.state.pool
-        with pool.connection() as conn:
-            yield conn
+        async with request.app.state.pool_slots:
+            conn = await run_in_threadpool(pool.getconn)
+            try:
+                yield conn
+            finally:
+                await run_in_threadpool(pool.putconn, conn)
 
     Db = Annotated[Conn, Depends(get_conn)]
     AuthHeader = Annotated[str | None, Header()]
